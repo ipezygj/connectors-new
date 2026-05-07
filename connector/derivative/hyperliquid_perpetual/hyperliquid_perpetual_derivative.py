@@ -27,6 +27,9 @@ class HyperliquidPerpetualDerivative:
         self._order_lock: asyncio.Lock = asyncio.Lock()
         self._order_book_lock: asyncio.Lock = asyncio.Lock()
         self._order_book: Dict[str, Any] = {}
+        self._order_books: Dict[str, Dict[str, Any]] = {}
+        self._order_book_locks: Dict[str, asyncio.Lock] = {}
+        self._order_book_ws_times: Dict[str, int] = {}
         self._session: Optional[aiohttp.ClientSession] = None
 
     # ------------------------------------------------------------------
@@ -152,6 +155,52 @@ class HyperliquidPerpetualDerivative:
         meta = await self.get_exchange_meta()
         return meta.get("universe", [])
 
+    async def get_all_mids(self) -> Dict[str, str]:
+        return await self._post_info({"type": "allMids"})
+
+    # ------------------------------------------------------------------
+    # L1 sync protocol surface
+    # ------------------------------------------------------------------
+
+    async def read_top_of_book(self, symbol: str) -> Optional[Dict[str, float]]:
+        lock = self._order_book_locks.get(symbol)
+        if lock is None:
+            return None
+        async with lock:
+            book = self._order_books.get(symbol)
+            if not book:
+                return None
+            bids = book.get("bids") or {}
+            asks = book.get("asks") or {}
+            if not bids or not asks:
+                return None
+            return {
+                "bid": max(bids.keys()),
+                "ask": min(asks.keys()),
+                "time_ms": float(self._order_book_ws_times.get(symbol, 0)),
+            }
+
+    async def replace_order_book(self, symbol: str, snapshot: Dict[str, Any]) -> None:
+        levels = snapshot.get("levels")
+        if not isinstance(levels, list) or len(levels) < 2:
+            return
+        try:
+            bids_dict = {float(b["px"]): float(b["sz"]) for b in levels[0]}
+            asks_dict = {float(a["px"]): float(a["sz"]) for a in levels[1]}
+        except (KeyError, TypeError, ValueError):
+            return
+        rest_time = snapshot.get("time")
+
+        lock = self._order_book_locks.setdefault(symbol, asyncio.Lock())
+        async with lock:
+            self._order_books[symbol] = {"bids": bids_dict, "asks": asks_dict}
+            if rest_time is not None:
+                self._order_book_ws_times[symbol] = int(rest_time)
+
+    def last_ws_time_ms(self, symbol: str) -> Optional[int]:
+        ts = self._order_book_ws_times.get(symbol)
+        return ts if ts else None
+
     # ------------------------------------------------------------------
     # WebSocket — order book
     # ------------------------------------------------------------------
@@ -181,11 +230,25 @@ class HyperliquidPerpetualDerivative:
         if "levels" not in payload:
             return
 
+        levels = payload["levels"]
+        if len(levels) < 2:
+            return
+
+        bids_dict = {float(b["px"]): float(b["sz"]) for b in levels[0]}
+        asks_dict = {float(a["px"]): float(a["sz"]) for a in levels[1]}
+        time_ms = int(payload.get("time", 0))
+        coin = payload.get("coin")
+
         async with self._order_book_lock:
-            levels = payload["levels"]
-            if len(levels) >= 2:
-                self._order_book["bids"] = {float(b["px"]): float(b["sz"]) for b in levels[0]}
-                self._order_book["asks"] = {float(a["px"]): float(a["sz"]) for a in levels[1]}
+            self._order_book["bids"] = bids_dict
+            self._order_book["asks"] = asks_dict
+
+        if coin:
+            lock = self._order_book_locks.setdefault(coin, asyncio.Lock())
+            async with lock:
+                self._order_books[coin] = {"bids": bids_dict, "asks": asks_dict}
+                if time_ms:
+                    self._order_book_ws_times[coin] = time_ms
 
     # ------------------------------------------------------------------
     # WebSocket — user stream

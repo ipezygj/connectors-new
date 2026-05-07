@@ -93,3 +93,16 @@ ORDER_STATUS_POLL_INTERVAL: float = 10.0
 FUNDING_RATE_POLL_INTERVAL: float = 60.0
 HEARTBEAT_TIMEOUT: float = 30.0
 API_CALL_TIMEOUT: float = 10.0
+
+# ---------------------------------------------------------------------------
+# L1 State Synchronization Validator
+# ---------------------------------------------------------------------------
+L1_SYNC_INTERVAL_SEC: float = 1.0
+L1_SYNC_STALENESS_THRESHOLD_MS: int = 1500
+L1_SYNC_DRIFT_THRESHOLD_BPS: float = 5.0
+L1_SYNC_DRIFT_HALT_BPS: float = 100.0
+L1_SYNC_MAX_CONSECUTIVE_FAILURES: int = 3
+L1_SYNC_REST_TIMEOUT_SEC: float = 1.0
+L1_SYNC_BULK_FALLBACK_SYMBOL_COUNT: int = 10
+L1_SYNC_LOG_SUMMARY_INTERVAL_SEC: float = 60.0
+L1_SYNC_SHADOW_MODE_ENV: str = "L1_SYNC_SHADOW_MODE"
