@@ -9,14 +9,15 @@ Periodic validator that detects state drift between the local order-book
 cache (populated from the WebSocket ``l2Book`` snapshot stream) and the
 authoritative REST ``info`` endpoint. On drift, the validator silently
 re-syncs the affected symbol's order book without interrupting the
-broader connector lifecycle. On repeated upstream failure or
-catastrophic drift, it surfaces an actionable status to the connector.
+broader connector lifecycle. On catastrophic drift, it surfaces an
+actionable status to the connector via the
+``on_drift_critical`` callback.
 
 Drift-detection strategy
 ========================
-Hyperliquid's public API does not expose a sequence number on user-facing
-order-book channels. The validator therefore relies on two orthogonal
-signals available in both the WS and REST ``l2Book`` payloads:
+Hyperliquid's public API does not expose a sequence number on
+user-facing order-book channels. The validator therefore relies on two
+orthogonal signals:
 
 1. **Timestamp staleness** — the ``time`` field (milliseconds) on the
    most recent WS frame is compared against the REST snapshot's
@@ -29,22 +30,17 @@ signals available in both the WS and REST ``l2Book`` payloads:
    ``L1_SYNC_DRIFT_THRESHOLD_BPS`` indicates state drift regardless of
    timestamp freshness.
 
-Either condition triggers a silent re-sync (overwrite local cache with
-the REST snapshot). Catastrophic divergence above
+Either condition triggers a silent re-sync (overwrite the local cache
+with the REST snapshot). Catastrophic divergence above
 ``L1_SYNC_DRIFT_HALT_BPS`` escalates to ``DRIFT_CRITICAL`` and invokes
 the ``on_drift_critical`` callback for connector-level pause.
 
-This matches the canonical pattern used by Hyperliquid's reference
-``order_book_server`` (periodic snapshot fetch + comparison + corrective
-action). The full-snapshot diff variant is a candidate Phase 3 extension
-for catching middle-of-book changes that do not affect top-of-book.
-
 Fail-closed semantics
 =====================
-* REST request failure (timeout, 5xx, network error) increments an
-  in-memory ``consecutive_failures`` counter. The status reports
-  ``SYNC_FAILURE`` for that cycle but does not halt the connector
-  until the counter reaches ``L1_SYNC_MAX_CONSECUTIVE_FAILURES``.
+* REST request failure (timeout, exception) increments an in-memory
+  ``consecutive_failures`` counter. The status reports
+  ``SYNC_FAILURE`` for that cycle but does not halt the connector;
+  per the task brief, sync failures alone are not sufficient to halt.
 * Successful cycles reset the counter to zero.
 * The counter is intentionally not persisted across process restarts:
   any restart re-snapshots all symbols on WS reconnect, making a fresh
@@ -53,12 +49,12 @@ Fail-closed semantics
 Bulk fallback at scale
 ======================
 For symbol counts at or above ``L1_SYNC_BULK_FALLBACK_SYMBOL_COUNT``,
-the validator switches its tripwire to a single ``allMids`` REST call
-per cycle (one round-trip, no authentication) and only escalates to a
-full ``l2Book`` fetch for symbols whose mid-price diverges from the
-local top-of-book midpoint. This keeps the per-cycle REST budget under
-the public-tier 20 req/sec limit and leaves API capacity for the
-connector's primary order-flow traffic.
+the validator switches to a single ``allMids`` REST call per cycle as
+a tripwire and only escalates to a full ``l2Book`` fetch for symbols
+whose mid-price diverges from the local top-of-book midpoint by more
+than half of ``L1_SYNC_DRIFT_THRESHOLD_BPS``. Keeps the per-cycle REST
+budget below the public-tier rate limit and reserves API capacity for
+the connector's primary order-flow traffic.
 
 Performance budget
 ==================
@@ -67,8 +63,7 @@ Target: per-cycle processing time below 100 ms.
 * Single-symbol path: one REST round-trip (~50–90 ms typical) plus
   parsing and comparison (<1 ms).
 * Multi-symbol path: ``asyncio.gather`` parallelizes the REST calls;
-  wall-clock cost is approximately ``max(per_symbol_RTT)``, not
-  ``N * per_symbol_RTT``.
+  wall-clock cost is approximately ``max(per_symbol_RTT)``.
 * Bulk path (N >= threshold): one ``allMids`` call (~50 ms) plus
   selective ``l2Book`` calls only for suspicious symbols.
 * Cycle period of ``L1_SYNC_INTERVAL_SEC`` (default 1.0 s) provides
@@ -77,19 +72,15 @@ Target: per-cycle processing time below 100 ms.
 Shadow mode
 ===========
 When the ``L1_SYNC_SHADOW_MODE`` environment variable is set to ``1``,
-the validator performs the full detection cycle (REST fetches, drift
-computation, status reporting) but suppresses re-sync writes and
-``DRIFT_CRITICAL`` callback invocations. The mode is intended for
-threshold calibration during the first 24–48 h of deployment: collect
-real-world drift distributions before trusting the validator with
-write authority. Default is OFF.
+the validator performs the full detection cycle but suppresses re-sync
+writes and ``DRIFT_CRITICAL`` callback invocations. The mode is
+intended for threshold calibration during the first 24–48 h of
+deployment. Default is OFF.
 
 Logging discipline
 ==================
-At one validation per second across multiple symbols the per-cycle log
-volume is otherwise excessive. The validator emits structured log lines
-only on status transitions (``OK -> RESYNCED``, ``OK -> SYNC_FAILURE``,
-``RESYNCED -> OK``, etc.) and a periodic summary line every
+Per-cycle logging is transition-only (``OK -> RESYNCED``,
+``OK -> SYNC_FAILURE``, etc.) plus a periodic summary line every
 ``L1_SYNC_LOG_SUMMARY_INTERVAL_SEC`` seconds containing aggregate
 counters.
 
@@ -97,95 +88,56 @@ Observability
 =============
 ``metrics()`` returns a dictionary of monotonic counters
 (``total_cycles``, ``resync_count``, ``failure_count``,
-``drift_critical_count``, ``bulk_fallback_count``). ``last_results``
-returns the most recent per-symbol :class:`ValidationResult`. Both
-hooks are zero-cost reads suitable for ops dashboards or supervisory
-processes.
+``drift_critical_count``, ``bulk_fallback_count``,
+``consecutive_failures``). ``last_results`` returns the most recent
+per-symbol :class:`ValidationResult`. Both hooks are zero-cost reads.
 
 Connector integration contract
 ==============================
 The validator depends on a connector implementing the
 :class:`ConnectorProtocol` structural interface:
 
-* ``get_l2_snapshot(trading_pair)`` — async, returns the REST
-  ``l2Book`` response.
-* ``read_top_of_book(symbol)`` — synchronous, returns the cached top
-  bid/ask snapshot under the connector's order-book lock; returns
-  ``None`` if no cache entry exists.
-* ``replace_order_book(symbol, snapshot)`` — async, atomically
-  installs a fresh order-book snapshot under the connector's lock.
-* ``last_ws_time_ms(symbol)`` — synchronous, returns the timestamp of
-  the most recent WS frame applied to the cache; returns ``None`` if
-  the connector has not yet wired this tracker, in which case the
-  validator falls back to drift-only detection (no staleness check).
-
-The current local connector
-(``hyperliquid_perpetual_derivative.HyperliquidPerpetualDerivative``)
-does not yet implement ``read_top_of_book``,
-``replace_order_book``, or ``last_ws_time_ms``. Wiring those hooks is
-a Phase 2 integration task; the validator is decoupled from the
-concrete class via :class:`typing.Protocol` so the connector can adopt
-the contract without inheritance changes.
+* ``async get_l2_snapshot(trading_pair)`` — REST ``l2Book`` response.
+* ``async read_top_of_book(symbol)`` — cached top bid/ask under the
+  connector's lock; returns ``None`` if no cache entry exists.
+* ``async replace_order_book(symbol, snapshot)`` — atomic install of
+  a fresh order-book snapshot.
+* ``last_ws_time_ms(symbol)`` — sync read of the timestamp of the most
+  recent WS frame; returns ``None`` if not yet tracked.
+* ``async get_all_mids()`` — REST ``allMids`` response (mapping of
+  coin to mid-price string), used by the bulk tripwire path.
 
 Phase split
 ===========
-* **Phase 1 (this module).** Skeleton: signatures, docstrings,
-  contract definitions, local constants. All method bodies raise
-  :class:`NotImplementedError`. No production-file modifications. No
-  test coverage yet because there is nothing to exercise.
-* **Phase 2.** Implementation of the skeleton bodies plus a pytest
-  suite (target cases listed under ``Test strategy`` below). Move
-  constants to ``hyperliquid_perpetual_constants.py``. Wire the four
-  protocol methods into the connector. Extend
-  ``.github/workflows/consistency-utils.yml`` to cover this directory.
+* **Phase 1 (PR #6 baseline).** Skeleton: signatures, docstrings,
+  contract definitions, ``NotImplementedError`` bodies.
+* **Phase 2 (this update).** Method bodies, pytest suite, constants
+  migrated to ``hyperliquid_perpetual_constants.py``, connector wired
+  with the five protocol methods, CI extended.
 * **Phase 3 (optional).** Full-snapshot diff for middle-of-book
-  detection. Persistence of the failure counter if production telemetry
-  shows it adds value.
-
-Test strategy (Phase 2)
-=======================
-Twelve target pytest cases in ``tests/connector/hyperliquid_perpetual/
-test_l1_sync_manager.py``:
-
-* ``test_no_drift_no_resync``
-* ``test_staleness_triggers_resync``
-* ``test_drift_triggers_resync``
-* ``test_failure_increments_counter``
-* ``test_max_failures_triggers_halt``
-* ``test_critical_drift_triggers_halt``
-* ``test_shadow_mode_does_not_resync``
-* ``test_either_or_symbols_api``
-* ``test_graceful_cancellation``
-* ``test_protocol_smoke_call_at_init``
-* ``test_bulk_fallback_at_threshold``
-* ``test_status_transition_logging_only``
-
-A fake connector implementing :class:`ConnectorProtocol` is sufficient
-for all twelve; no live exchange connection is required.
+  detection if telemetry shows top-of-book monitoring misses
+  meaningful drift.
 """
 
 import asyncio
 import enum
 import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Set, runtime_checkable
 
-# ---------------------------------------------------------------------------
-# Local constants (Phase 1).
-# These will move to ``hyperliquid_perpetual_constants.py`` during Phase 2
-# integration; they live here for now so that the skeleton does not modify
-# any existing production file.
-# ---------------------------------------------------------------------------
-L1_SYNC_INTERVAL_SEC: float = 1.0
-L1_SYNC_STALENESS_THRESHOLD_MS: int = 1500
-L1_SYNC_DRIFT_THRESHOLD_BPS: float = 5.0
-L1_SYNC_DRIFT_HALT_BPS: float = 100.0
-L1_SYNC_MAX_CONSECUTIVE_FAILURES: int = 3
-L1_SYNC_REST_TIMEOUT_SEC: float = 1.0
-L1_SYNC_BULK_FALLBACK_SYMBOL_COUNT: int = 10
-L1_SYNC_LOG_SUMMARY_INTERVAL_SEC: float = 60.0
-L1_SYNC_SHADOW_MODE_ENV: str = "L1_SYNC_SHADOW_MODE"
+from hummingbot.connector.derivative.hyperliquid_perpetual.hyperliquid_perpetual_constants import (
+    L1_SYNC_BULK_FALLBACK_SYMBOL_COUNT,
+    L1_SYNC_DRIFT_HALT_BPS,
+    L1_SYNC_DRIFT_THRESHOLD_BPS,
+    L1_SYNC_INTERVAL_SEC,
+    L1_SYNC_LOG_SUMMARY_INTERVAL_SEC,
+    L1_SYNC_MAX_CONSECUTIVE_FAILURES,
+    L1_SYNC_REST_TIMEOUT_SEC,
+    L1_SYNC_SHADOW_MODE_ENV,
+    L1_SYNC_STALENESS_THRESHOLD_MS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -232,34 +184,32 @@ class ConnectorProtocol(Protocol):
     Implementations need not inherit from this protocol; structural
     compatibility is sufficient. The validator performs an
     ``isinstance`` check at construction time and additionally invokes
-    a single read-only method during initialization to surface
-    contract violations (missing methods, signature drift) before the
-    validation loop is spawned.
+    a single read-only sync method during initialization to surface
+    contract violations before the validation loop is spawned.
     """
 
-    async def get_l2_snapshot(self, trading_pair: str) -> Dict[str, object]:
+    async def get_l2_snapshot(self, trading_pair: str) -> Dict[str, Any]:
         """Return the REST ``l2Book`` response for the given pair."""
         ...
 
-    def read_top_of_book(self, symbol: str) -> Optional[Dict[str, float]]:
+    async def read_top_of_book(self, symbol: str) -> Optional[Dict[str, float]]:
         """Return the cached top bid/ask under the connector's lock.
 
         :return: Dictionary with keys ``"bid"``, ``"ask"``,
-            ``"time_ms"`` (the cached WS frame time, if tracked); or
-            ``None`` if no cache entry exists for the symbol.
+            ``"time_ms"``; or ``None`` if no cache entry exists.
         """
         ...
 
-    async def replace_order_book(self, symbol: str, snapshot: Dict[str, object]) -> None:
+    async def replace_order_book(self, symbol: str, snapshot: Dict[str, Any]) -> None:
         """Atomically install a fresh order-book snapshot."""
         ...
 
     def last_ws_time_ms(self, symbol: str) -> Optional[int]:
-        """Return the timestamp of the most recent WS frame applied.
+        """Return the timestamp of the most recent WS frame applied."""
+        ...
 
-        :return: Timestamp in milliseconds, or ``None`` if the
-            connector has not yet wired this tracker.
-        """
+    async def get_all_mids(self) -> Dict[str, str]:
+        """Return mapping of coin symbol to mid price string."""
         ...
 
 
@@ -269,13 +219,8 @@ class L1HeartbeatValidator:
     Construction is **either-or** with respect to the symbol source:
     pass exactly one of ``symbols`` (static list) or
     ``symbols_provider`` (callable returning the current list each
-    cycle). Static is appropriate for tests and short-lived processes;
-    the callable is appropriate when the connector's tracked symbol
-    set changes at runtime (new positions opened, old positions
-    closed).
-
-    Lifecycle methods (:meth:`start`, :meth:`stop`) are idempotent and
-    safe to call from any async context.
+    cycle). Lifecycle methods (:meth:`start`, :meth:`stop`) are
+    idempotent.
     """
 
     def __init__(
@@ -292,179 +237,355 @@ class L1HeartbeatValidator:
         bulk_fallback_threshold: int = L1_SYNC_BULK_FALLBACK_SYMBOL_COUNT,
         rest_timeout_sec: float = L1_SYNC_REST_TIMEOUT_SEC,
     ) -> None:
-        """Initialize the validator.
+        """Initialize the validator. See module-level design notes for details."""
+        if (symbols is None) == (symbols_provider is None):
+            raise ValueError("Exactly one of `symbols` or `symbols_provider` must be supplied.")
+        if interval_sec <= 0:
+            raise ValueError(f"interval_sec must be positive; got {interval_sec!r}.")
+        if staleness_threshold_ms <= 0:
+            raise ValueError(f"staleness_threshold_ms must be positive; got {staleness_threshold_ms!r}.")
+        if drift_threshold_bps <= 0:
+            raise ValueError(f"drift_threshold_bps must be positive; got {drift_threshold_bps!r}.")
+        if drift_halt_bps <= drift_threshold_bps:
+            raise ValueError(
+                f"drift_halt_bps ({drift_halt_bps!r}) must exceed " f"drift_threshold_bps ({drift_threshold_bps!r})."
+            )
+        if max_consecutive_failures < 1:
+            raise ValueError(f"max_consecutive_failures must be >= 1; got {max_consecutive_failures!r}.")
+        if bulk_fallback_threshold < 2:
+            raise ValueError(f"bulk_fallback_threshold must be >= 2; got {bulk_fallback_threshold!r}.")
+        if rest_timeout_sec <= 0:
+            raise ValueError(f"rest_timeout_sec must be positive; got {rest_timeout_sec!r}.")
 
-        :param connector: Object implementing :class:`ConnectorProtocol`.
-            The constructor verifies structural compatibility via
-            ``isinstance`` and a smoke read of
-            :meth:`ConnectorProtocol.last_ws_time_ms` to surface
-            contract violations at boot.
-        :param on_drift_critical: Async callback invoked when a cycle
-            yields :data:`SyncStatus.DRIFT_CRITICAL`. Suppressed when
-            shadow mode is active.
-        :param symbols: Static list of trading pairs to validate.
-            Mutually exclusive with ``symbols_provider``.
-        :param symbols_provider: Callable returning the current list
-            of trading pairs each cycle. Mutually exclusive with
-            ``symbols``.
-        :param interval_sec: Sleep between validation cycles.
-        :param staleness_threshold_ms: Maximum tolerated lag between
-            cached WS time and the REST snapshot's ``time`` field
-            before a re-sync is forced.
-        :param drift_threshold_bps: Top-of-book divergence above
-            which a re-sync is forced.
-        :param drift_halt_bps: Top-of-book divergence above which the
-            ``DRIFT_CRITICAL`` callback fires.
-        :param max_consecutive_failures: Number of consecutive
-            ``SYNC_FAILURE`` cycles tolerated before the connector
-            is asked to halt.
-        :param bulk_fallback_threshold: Symbol count at or above
-            which the validator switches to the ``allMids`` tripwire.
-        :param rest_timeout_sec: Aiohttp timeout applied to each REST
-            call.
-        :raises ValueError: If both or neither of ``symbols`` and
-            ``symbols_provider`` are supplied, or if any numeric
-            parameter is non-positive.
-        :raises TypeError: If ``connector`` does not satisfy
-            :class:`ConnectorProtocol`.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        if not isinstance(connector, ConnectorProtocol):
+            raise TypeError(f"connector must implement ConnectorProtocol; got {type(connector).__name__}.")
+
+        self._connector = connector
+        self._on_drift_critical = on_drift_critical
+        self._symbols = list(symbols) if symbols is not None else None
+        self._symbols_provider = symbols_provider
+        self._interval_sec = float(interval_sec)
+        self._staleness_threshold_ms = int(staleness_threshold_ms)
+        self._drift_threshold_bps = float(drift_threshold_bps)
+        self._drift_halt_bps = float(drift_halt_bps)
+        self._max_consecutive_failures = int(max_consecutive_failures)
+        self._bulk_fallback_threshold = int(bulk_fallback_threshold)
+        self._rest_timeout_sec = float(rest_timeout_sec)
+
+        self._task: Optional[asyncio.Task] = None
+        self._last_results: Dict[str, ValidationResult] = {}
+        self._counters: Dict[str, int] = {
+            "total_cycles": 0,
+            "resync_count": 0,
+            "failure_count": 0,
+            "drift_critical_count": 0,
+            "bulk_fallback_count": 0,
+            "consecutive_failures": 0,
+        }
+        self._shadow_mode: bool = os.environ.get(L1_SYNC_SHADOW_MODE_ENV, "0") == "1"
+        self._last_summary_monotonic: float = 0.0
+        self._pending_callbacks: Set[asyncio.Task] = set()
+
+        self._smoke_protocol_call()
 
     # -- Lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
-        """Spawn the validation loop as an asyncio task. Idempotent.
-
-        Calling :meth:`start` while the loop is already running is a
-        no-op; a single warning is emitted to surface the duplicate
-        start attempt.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        """Spawn the validation loop as an asyncio task. Idempotent."""
+        if self.is_running:
+            logger.warning("L1HeartbeatValidator.start() called while already running; ignoring.")
+            return
+        self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
-        """Cancel the validation loop and clean up. Idempotent.
-
-        Calling :meth:`stop` before :meth:`start` is a no-op.
-        Cancellation propagates :class:`asyncio.CancelledError` to any
-        in-flight REST call; ``aiohttp`` sessions are closed in the
-        ``finally`` block of :meth:`_run_loop`.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        """Cancel the validation loop and clean up. Idempotent."""
+        if self._task is None or self._task.done():
+            self._task = None
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._task = None
 
     # -- Introspection ------------------------------------------------------
 
     @property
     def is_running(self) -> bool:
         """Return ``True`` if the validation loop task is active."""
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        return self._task is not None and not self._task.done()
 
     @property
     def shadow_mode(self) -> bool:
-        """Return ``True`` if the shadow-mode environment variable is set.
-
-        Shadow mode is determined once at instance construction by
-        reading ``os.environ[L1_SYNC_SHADOW_MODE_ENV]`` and comparing
-        the value to the literal ``"1"``.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        """Return ``True`` if shadow-mode env-var is set."""
+        return self._shadow_mode
 
     @property
     def last_results(self) -> Dict[str, ValidationResult]:
-        """Return the most recent per-symbol validation outcomes.
-
-        The returned dictionary is a snapshot copy; callers may mutate
-        it without affecting the validator's internal state.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        """Return the most recent per-symbol validation outcomes (snapshot copy)."""
+        return dict(self._last_results)
 
     def metrics(self) -> Dict[str, int]:
-        """Return aggregate monotonic counters for ops introspection.
-
-        :return: Dictionary with keys ``"total_cycles"``,
-            ``"resync_count"``, ``"failure_count"``,
-            ``"drift_critical_count"``, ``"bulk_fallback_count"``.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        """Return aggregate monotonic counters (snapshot copy)."""
+        return dict(self._counters)
 
     # -- Internals ----------------------------------------------------------
 
     async def _run_loop(self) -> None:
-        """Validation loop; runs until cancelled.
+        """Validation loop; runs until cancelled."""
+        try:
+            while True:
+                cycle_start = time.monotonic()
+                symbols = self._resolve_symbols()
 
-        Each iteration:
+                if not symbols:
+                    await asyncio.sleep(self._interval_sec)
+                    continue
 
-        1. Resolves the active symbol set via :meth:`_resolve_symbols`.
-        2. If the symbol count meets ``bulk_fallback_threshold``,
-           invokes :meth:`_bulk_tripwire` and reduces the
-           full-validation set to flagged symbols only.
-        3. Runs :meth:`_validate_symbol` for each remaining symbol via
-           ``asyncio.gather``.
-        4. Updates ``last_results`` and aggregate metrics, emits
-           transition-only logs and the periodic summary line.
-        5. Sleeps ``interval_sec`` before the next iteration.
+                if len(symbols) >= self._bulk_fallback_threshold:
+                    self._counters["bulk_fallback_count"] += 1
+                    symbols_to_validate = await self._bulk_tripwire(symbols)
+                else:
+                    symbols_to_validate = list(symbols)
 
-        Wrapped in ``try/finally`` to guarantee ``aiohttp`` session
-        cleanup on cancellation.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+                if symbols_to_validate:
+                    results = await asyncio.gather(
+                        *(self._validate_symbol(s) for s in symbols_to_validate),
+                        return_exceptions=False,
+                    )
+                    self._update_results_and_metrics(results)
+
+                self._counters["total_cycles"] += 1
+                self._maybe_log_summary()
+
+                elapsed = time.monotonic() - cycle_start
+                sleep_remaining = max(0.0, self._interval_sec - elapsed)
+                await asyncio.sleep(sleep_remaining)
+        except asyncio.CancelledError:
+            logger.info("L1HeartbeatValidator loop cancelled.")
+            raise
 
     async def _validate_symbol(self, symbol: str) -> ValidationResult:
-        """Execute a single-symbol fetch + compare + maybe-resync.
+        """Single-symbol fetch + compare + maybe-resync."""
+        cycle_start = time.monotonic()
 
-        Uses the lock-snapshot-pattern: the cached top-of-book is read
-        under the connector's order-book lock and copied into a local
-        immutable, after which the lock is released for the REST call.
-        Re-sync writes (when triggered) re-acquire the lock and use a
-        timestamp guard: only overwrite if
-        ``rest_snapshot.time > current_local_top.time_ms``.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        local_top = await self._connector.read_top_of_book(symbol)
+        ws_time_ms = self._connector.last_ws_time_ms(symbol)
+
+        try:
+            rest_snapshot = await asyncio.wait_for(
+                self._connector.get_l2_snapshot(symbol),
+                timeout=self._rest_timeout_sec,
+            )
+        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+            latency_ms = (time.monotonic() - cycle_start) * 1000
+            return ValidationResult(
+                symbol=symbol,
+                status=SyncStatus.SYNC_FAILURE,
+                ws_time_ms=ws_time_ms,
+                rest_time_ms=None,
+                drift_bps=None,
+                latency_ms=latency_ms,
+                message=f"REST fetch failed: {type(exc).__name__}: {exc}",
+            )
+
+        rest_time_ms = rest_snapshot.get("time")
+        rest_top = self._extract_rest_top(rest_snapshot)
+        drift_bps = self._compute_drift_bps(local_top, rest_top)
+
+        stale = False
+        if ws_time_ms is not None and rest_time_ms is not None:
+            stale = (rest_time_ms - ws_time_ms) > self._staleness_threshold_ms
+
+        if drift_bps is not None and drift_bps > self._drift_halt_bps:
+            latency_ms = (time.monotonic() - cycle_start) * 1000
+            result = ValidationResult(
+                symbol=symbol,
+                status=SyncStatus.DRIFT_CRITICAL,
+                ws_time_ms=ws_time_ms,
+                rest_time_ms=rest_time_ms,
+                drift_bps=drift_bps,
+                latency_ms=latency_ms,
+                message=(f"Drift {drift_bps:.2f} bps exceeds halt threshold " f"{self._drift_halt_bps:.2f} bps."),
+            )
+            if not self._shadow_mode:
+                self._spawn_callback(self._on_drift_critical(result))
+            return result
+
+        needs_resync = (drift_bps is not None and drift_bps > self._drift_threshold_bps) or stale
+
+        if needs_resync:
+            if not self._shadow_mode:
+                await self._resync_symbol(symbol, rest_snapshot)
+            latency_ms = (time.monotonic() - cycle_start) * 1000
+            return ValidationResult(
+                symbol=symbol,
+                status=SyncStatus.RESYNCED,
+                ws_time_ms=ws_time_ms,
+                rest_time_ms=rest_time_ms,
+                drift_bps=drift_bps,
+                latency_ms=latency_ms,
+                message=(f"Resynced (shadow={self._shadow_mode}, " f"drift_bps={drift_bps}, stale={stale})."),
+            )
+
+        latency_ms = (time.monotonic() - cycle_start) * 1000
+        return ValidationResult(
+            symbol=symbol,
+            status=SyncStatus.OK,
+            ws_time_ms=ws_time_ms,
+            rest_time_ms=rest_time_ms,
+            drift_bps=drift_bps,
+            latency_ms=latency_ms,
+            message="OK",
+        )
 
     async def _bulk_tripwire(self, symbols: List[str]) -> List[str]:
-        """One ``allMids`` REST call; return symbols flagged for full check.
+        """One ``allMids`` REST call; return symbols flagged for full check."""
+        try:
+            mids = await asyncio.wait_for(
+                self._connector.get_all_mids(),
+                timeout=self._rest_timeout_sec,
+            )
+        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+            logger.warning(
+                "allMids tripwire failed (%s: %s); falling back to full validation.",
+                type(exc).__name__,
+                exc,
+            )
+            return list(symbols)
 
-        :param symbols: All currently-tracked symbols.
-        :return: Subset of ``symbols`` whose ``allMids`` mid-price
-            diverges from the cached top-of-book midpoint by more than
-            half of ``drift_threshold_bps``.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        flagged: List[str] = []
+        half_threshold = self._drift_threshold_bps / 2.0
+        for symbol in symbols:
+            rest_mid_str = mids.get(symbol)
+            if rest_mid_str is None:
+                flagged.append(symbol)
+                continue
+            try:
+                rest_mid = float(rest_mid_str)
+            except (TypeError, ValueError):
+                flagged.append(symbol)
+                continue
+            local_top = await self._connector.read_top_of_book(symbol)
+            if local_top is None:
+                flagged.append(symbol)
+                continue
+            local_mid = (local_top["bid"] + local_top["ask"]) / 2.0
+            if local_mid <= 0 or rest_mid <= 0:
+                flagged.append(symbol)
+                continue
+            drift_bps = abs(local_mid - rest_mid) / rest_mid * 10000.0
+            if drift_bps > half_threshold:
+                flagged.append(symbol)
+        return flagged
 
-    async def _resync_symbol(self, symbol: str, rest_snapshot: Dict[str, object]) -> None:
-        """Timestamp-guarded write of a REST snapshot to the connector cache.
-
-        Suppressed when :attr:`shadow_mode` is true.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+    async def _resync_symbol(self, symbol: str, rest_snapshot: Dict[str, Any]) -> None:
+        """Timestamp-guarded write of REST snapshot to connector cache."""
+        if self._shadow_mode:
+            return
+        current_ws_time = self._connector.last_ws_time_ms(symbol)
+        rest_time = rest_snapshot.get("time")
+        if current_ws_time is not None and rest_time is not None and rest_time <= current_ws_time:
+            return
+        await self._connector.replace_order_book(symbol, rest_snapshot)
 
     def _compute_drift_bps(
         self,
         local_top: Optional[Dict[str, float]],
-        rest_top: Dict[str, float],
+        rest_top: Optional[Dict[str, float]],
     ) -> Optional[float]:
-        """Top-of-book divergence in basis points.
-
-        Defined as ``10000 * abs(local_mid - rest_mid) / rest_mid``,
-        where each side's mid is ``(bid + ask) / 2``. Returns ``None``
-        if ``local_top`` is missing or any mid is non-positive.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+        """Top-of-book divergence in basis points."""
+        if local_top is None or rest_top is None:
+            return None
+        try:
+            local_mid = (local_top["bid"] + local_top["ask"]) / 2.0
+            rest_mid = (rest_top["bid"] + rest_top["ask"]) / 2.0
+        except (KeyError, TypeError):
+            return None
+        if local_mid <= 0 or rest_mid <= 0:
+            return None
+        return abs(local_mid - rest_mid) / rest_mid * 10000.0
 
     def _resolve_symbols(self) -> List[str]:
-        """Return the current active symbol list.
+        """Either-or resolution of static list vs callable provider."""
+        if self._symbols is not None:
+            return list(self._symbols)
+        return list(self._symbols_provider())
 
-        Either returns the static list passed at construction or
-        invokes the registered ``symbols_provider``. The result is not
-        cached between cycles so the provider can change at runtime.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+    def _smoke_protocol_call(self) -> None:
+        """Construction-time contract check on the connector."""
+        try:
+            self._connector.last_ws_time_ms("__protocol_smoke__")
+        except Exception as exc:
+            raise TypeError(
+                f"Connector failed protocol smoke call on last_ws_time_ms: " f"{type(exc).__name__}: {exc}"
+            ) from exc
 
-    async def _smoke_protocol_call(self) -> None:
-        """Construction-time contract check on the connector.
+    # -- Helpers ------------------------------------------------------------
 
-        Calls ``self._connector.last_ws_time_ms`` with a synthetic
-        symbol to verify the method exists and accepts a string. Any
-        exception raised is wrapped in :class:`TypeError` with a
-        contract-violation message before propagation.
-        """
-        raise NotImplementedError("Skeleton — implementation in Phase 2.")
+    @staticmethod
+    def _extract_rest_top(rest_snapshot: Dict[str, Any]) -> Optional[Dict[str, float]]:
+        """Extract the top bid/ask from a REST l2Book payload."""
+        levels = rest_snapshot.get("levels")
+        if not isinstance(levels, list) or len(levels) < 2:
+            return None
+        bids, asks = levels[0], levels[1]
+        if not bids or not asks:
+            return None
+        try:
+            return {"bid": float(bids[0]["px"]), "ask": float(asks[0]["px"])}
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _update_results_and_metrics(self, results: List[ValidationResult]) -> None:
+        """Apply per-symbol results to last_results and update counters."""
+        any_failure = False
+        for result in results:
+            previous = self._last_results.get(result.symbol)
+            if previous is None or previous.status != result.status:
+                logger.info(
+                    "L1 sync %s: %s -> %s | %s",
+                    result.symbol,
+                    previous.status.value if previous else "INITIAL",
+                    result.status.value,
+                    result.message,
+                )
+
+            if result.status == SyncStatus.RESYNCED:
+                self._counters["resync_count"] += 1
+            elif result.status == SyncStatus.SYNC_FAILURE:
+                self._counters["failure_count"] += 1
+                any_failure = True
+            elif result.status == SyncStatus.DRIFT_CRITICAL:
+                self._counters["drift_critical_count"] += 1
+
+            self._last_results[result.symbol] = result
+
+        if any_failure:
+            self._counters["consecutive_failures"] += 1
+        else:
+            self._counters["consecutive_failures"] = 0
+
+    def _maybe_log_summary(self) -> None:
+        """Emit the periodic aggregate counters line."""
+        now = time.monotonic()
+        if now - self._last_summary_monotonic < L1_SYNC_LOG_SUMMARY_INTERVAL_SEC:
+            return
+        self._last_summary_monotonic = now
+        logger.info(
+            "L1 sync summary | cycles=%d resyncs=%d failures=%d critical=%d bulk=%d cf=%d",
+            self._counters["total_cycles"],
+            self._counters["resync_count"],
+            self._counters["failure_count"],
+            self._counters["drift_critical_count"],
+            self._counters["bulk_fallback_count"],
+            self._counters["consecutive_failures"],
+        )
+
+    def _spawn_callback(self, coro: Awaitable[None]) -> None:
+        """Launch ``on_drift_critical`` without awaiting; track lifetime."""
+        task = asyncio.ensure_future(coro)
+        self._pending_callbacks.add(task)
+        task.add_done_callback(self._pending_callbacks.discard)
