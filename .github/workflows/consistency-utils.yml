@@ -5,10 +5,14 @@ on:
     branches: [main, master, development]
     paths:
       - "connector/derivative/backpack_perpetual/**"
+      - "skills/**"
+      - "tests/skills/**"
   pull_request:
     branches: [main, master, development]
     paths:
       - "connector/derivative/backpack_perpetual/**"
+      - "skills/**"
+      - "tests/skills/**"
     types: [ready_for_review, opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
@@ -31,6 +35,8 @@ jobs:
         with:
           PATTERNS: |
             connector/derivative/backpack_perpetual/**/*.py
+            skills/**/*.py
+            tests/skills/**/*.py
       - name: Check modified files
         id: check_files
         run: |
@@ -65,18 +71,25 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        run: pip install black "isort>=5.12,<6"
+        run: pip install black "isort>=5.12,<6" pytest numpy
 
       - name: Validate Black formatting
         run: |
-          black --check --line-length 120 connector/derivative/backpack_perpetual/ || {
+          black --check --line-length 120 \
+            connector/derivative/backpack_perpetual/ \
+            skills/ \
+            tests/skills/ || {
             echo "Black formatting check failed."
             exit 1
           }
 
       - name: Validate isort import ordering
         run: |
-          isort --check-only --profile black --line-length 120 -p hummingbot connector/derivative/backpack_perpetual/ || {
+          isort --check-only --profile black --line-length 120 \
+            -p hummingbot -p skills \
+            connector/derivative/backpack_perpetual/ \
+            skills/ \
+            tests/skills/ || {
             echo "Import ordering check failed."
             exit 1
           }
@@ -84,18 +97,24 @@ jobs:
       - name: Verify V2.1 Gateway docstrings
         shell: bash
         run: |
-          TARGET_DIR="connector/derivative/backpack_perpetual"
+          TARGET_DIRS=(
+            "connector/derivative/backpack_perpetual"
+            "skills"
+            "tests/skills"
+          )
           EXPECTED='"""Technical implementation for Hummingbot Gateway V2.1."""'
           FAILED=0
 
-          for f in $(find "$TARGET_DIR" -name "*.py" -not -name "__init__.py"); do
-            FIRST_LINE=$(head -n 1 "$f" | tr -d '\r')
-            if [ "$FIRST_LINE" != "$EXPECTED" ]; then
-              echo "FAIL: Missing V2.1 docstring in $f"
-              echo "  Found:    $FIRST_LINE"
-              echo "  Expected: $EXPECTED"
-              FAILED=1
-            fi
+          for dir in "${TARGET_DIRS[@]}"; do
+            for f in $(find "$dir" -name "*.py" -not -name "__init__.py"); do
+              FIRST_LINE=$(head -n 1 "$f" | tr -d '\r')
+              if [ "$FIRST_LINE" != "$EXPECTED" ]; then
+                echo "FAIL: Missing V2.1 docstring in $f"
+                echo "  Found:    $FIRST_LINE"
+                echo "  Expected: $EXPECTED"
+                FAILED=1
+              fi
+            done
           done
 
           if [ "$FAILED" -eq 1 ]; then
@@ -107,13 +126,21 @@ jobs:
       - name: Verify no restricted keywords
         shell: bash
         run: |
-          TARGET_DIR="connector/derivative/backpack_perpetual"
-          if grep -r -i -E "(Ferrari|Neural)" "$TARGET_DIR"; then
-            echo "FAIL: Restricted keywords detected."
-            exit 1
-          else
-            echo "No restricted keywords found."
-          fi
+          TARGET_DIRS=(
+            "connector/derivative/backpack_perpetual"
+            "skills"
+            "tests/skills"
+          )
+          for dir in "${TARGET_DIRS[@]}"; do
+            if grep -r -i -E "(Ferrari|Neural)" "$dir"; then
+              echo "FAIL: Restricted keywords detected in $dir."
+              exit 1
+            fi
+          done
+          echo "No restricted keywords found."
+
+      - name: Run skills pytest suite
+        run: pytest tests/skills/ -v
 
       - name: Report
         run: |
