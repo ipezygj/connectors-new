@@ -44,6 +44,11 @@ class PortfolioCorrelationSkill(SkillBase):
     The conservative trading default is to block entries when
     correlation cannot be measured, on the principle that an unmeasured
     risk is treated as the worst-case risk.
+
+    The correlation row across all ``N`` open positions is computed in
+    a single vectorized step (mean centring, matrix-vector product, and
+    element-wise division), giving an aggregate cost of ``O(N * M)`` for
+    lookback ``M``.
     """
 
     def __init__(
@@ -233,6 +238,13 @@ class PortfolioCorrelationSkill(SkillBase):
     ) -> Tuple[List[float], int]:
         """Compute Pearson correlations and count fail-closed NaN pairs.
 
+        Implementation is fully vectorized: the candidate's covariance
+        with every position is evaluated by a single matrix-vector
+        product, and the correlation row is obtained by an element-wise
+        division against the joint standard-deviation product. Total
+        cost is ``O(N * M)`` for ``N`` open positions and lookback
+        ``M``, dominated by the matmul.
+
         :return: Tuple ``(correlations, nan_pair_count)``. The
             ``correlations`` list contains every finite per-pair Pearson
             value in row order with NaN rows omitted. The
@@ -240,24 +252,37 @@ class PortfolioCorrelationSkill(SkillBase):
             NaN; any non-zero value triggers the fail-closed veto in
             :meth:`evaluate`.
         """
-        correlations: List[float] = []
-        nan_pair_count = 0
-        # ``np.errstate`` suppresses the noisy divide-by-zero / invalid-value
-        # RuntimeWarnings that ``np.corrcoef`` emits internally when a series
-        # has zero variance. The skill detects the resulting NaN explicitly
-        # via ``np.isnan`` below and converts it into a fail-closed veto, so
-        # the warning text would only clutter the logs without adding signal.
+        n_samples = candidate_returns.shape[0]
+
+        # ``np.errstate`` suppresses the divide-by-zero / invalid-value
+        # RuntimeWarnings emitted by zero-variance series. The skill
+        # detects the resulting NaNs explicitly below and converts them
+        # into a fail-closed veto.
         with np.errstate(invalid="ignore", divide="ignore"):
-            for index, position_returns in enumerate(portfolio_returns):
-                value = np.corrcoef(candidate_returns, position_returns)[0, 1]
-                if np.isnan(value):
-                    self.logger().warning(
-                        "Correlation NaN between %s and portfolio row %d "
-                        "(zero-variance or invalid series); fail-closed veto for this pair.",
-                        candidate_asset,
-                        index,
-                    )
-                    nan_pair_count += 1
-                    continue
-                correlations.append(float(value))
+            candidate_centered = candidate_returns - candidate_returns.mean()
+            portfolio_centered = portfolio_returns - portfolio_returns.mean(axis=1, keepdims=True)
+
+            # Covariances: one matmul produces all N pair covariances.
+            covariances = (portfolio_centered @ candidate_centered) / n_samples
+
+            # Joint standard-deviation product (population, ddof=0).
+            candidate_std = candidate_returns.std()
+            portfolio_stds = portfolio_returns.std(axis=1)
+            denominator = candidate_std * portfolio_stds
+
+            correlation_row = covariances / denominator
+
+        nan_mask = np.isnan(correlation_row)
+        nan_pair_count = int(nan_mask.sum())
+
+        if nan_pair_count > 0:
+            for index in np.flatnonzero(nan_mask).tolist():
+                self.logger().warning(
+                    "Correlation NaN between %s and portfolio row %d "
+                    "(zero-variance or invalid series); fail-closed veto for this pair.",
+                    candidate_asset,
+                    index,
+                )
+
+        correlations: List[float] = correlation_row[~nan_mask].astype(float).tolist()
         return correlations, nan_pair_count
